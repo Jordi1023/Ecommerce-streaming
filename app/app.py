@@ -29,17 +29,39 @@ if GEMINI_API_KEY:
 else:
     client_gemini = None
 
-# Función robusta para consultar Gemini en 1 sola llamada (optimiza cuotas y evita errores 429/503)
+# Función para procesar consultas en 1 sola llamada con manejo conversacional y fallback
 def process_agent_query(user_query, max_retries=2):
     """
     Agente Text-to-SQL de alta resiliencia:
-    1. Utiliza los modelos oficiales activos (gemini-3.6-flash / gemini-3.6-flash-lite).
-    2. Si la cuota gratuita se agota (429), conmuta automáticamente al motor analítico local.
+    - Maneja preguntas conversacionales y de capacidades.
+    - Genera SQL ANSI y diagnóstico para preguntas analíticas.
+    - Fallback local estructurado e inteligente.
     """
+    query_lower = user_query.lower()
+
+    # Detección de preguntas sobre capacidades o saludos
+    greeting_keywords = ["que haces", "que eres capaz", "quien eres", "capacidades", "ayuda", "hola"]
+    if any(k in query_lower for k in greeting_keywords) and not any(k in query_lower for k in ["venta", "producto", "pais", "top", "ingreso"]):
+        desc_text = """
+### 🤖 Capacidades del Asistente Analítico del Lakehouse
+
+Estoy conectado directamente a los datos consolidados en **AWS S3 / DuckDB** y puedo ayudarte con:
+
+* **📊 Análisis de Ventas Globales:** Consultar GMV acumulado, ticket promedio y cantidad de órdenes.
+* **🌍 Desempeño Geográfico:** Identificar los países con mayor y menor volumen transaccional.
+* **🏆 Rendimiento de Catálogo:** Ranking de productos más vendidos por unidades e ingresos generados.
+* **🔍 Generación SQL Auditable:** Traduzco tus consultas de negocio a queries SQL ANSI ejecutadas al instante en DuckDB.
+
+*Ejemplo de preguntas:*
+1. *"¿Cuáles son los 5 países con mayor facturación?"*
+2. *"¿Cuál es el producto líder en unidades vendidas?"*
+"""
+        return "-- Consulta conversacional / Presentación de capacidades", pd.DataFrame(), desc_text
+
     schema_prompt = f"""
 Eres un Analista de Datos Senior especializado en SQL (DuckDB) y analítica de E-Commerce.
 
-Esquema de tablas en memoria (DuckDB):
+Esquema de tablas en DuckDB:
 1. `df_products` (product_name VARCHAR, total_revenue DOUBLE, units_sold BIGINT, total_orders BIGINT)
 2. `df_countries` (country VARCHAR, total_revenue DOUBLE, unique_customers BIGINT, total_orders BIGINT, avg_order_value DOUBLE)
 
@@ -47,7 +69,7 @@ Pregunta del usuario: "{user_query}"
 
 INSTRUCCIONES:
 1. Genera una consulta SQL ANSI válida para DuckDB.
-2. Escribe una respuesta ejecutiva en español estructurada con métricas clave, totales en USD y conclusiones comerciales.
+2. Escribe una respuesta ejecutiva estructurada con métricas clave, totales en USD y conclusiones comerciales.
 3. Responde EXACTAMENTE en este formato separado por '---SPLIT---':
 
 [SQL PLANO SIN BLOQUES MARKDOWN]
@@ -55,55 +77,51 @@ INSTRUCCIONES:
 [ANÁLISIS EJECUTIVO EN FORMATO MARKDOWN]
 """
 
-    VALID_MODELS = [
-        'gemini-3.6-flash',
-        'gemini-3.6-flash-lite'
-    ]
+    VALID_MODELS = ['gemini-3.6-flash', 'gemini-3.6-flash-lite']
 
-    for model_name in VALID_MODELS:
-        for attempt in range(max_retries):
-            try:
-                response = client_gemini.models.generate_content(
-                    model=model_name,
-                    contents=schema_prompt,
-                )
-                full_text = response.text.strip()
+    if client_gemini:
+        for model_name in VALID_MODELS:
+            for attempt in range(max_retries):
+                try:
+                    response = client_gemini.models.generate_content(
+                        model=model_name,
+                        contents=schema_prompt,
+                    )
+                    full_text = response.text.strip()
 
-                if "---SPLIT---" in full_text:
-                    parts = full_text.split("---SPLIT---")
-                    sql_query = parts[0].replace("```sql", "").replace("```", "").strip()
-                    interpretation = parts[1].strip()
-                else:
-                    sql_query = "SELECT country, total_revenue, total_orders FROM df_countries ORDER BY total_revenue DESC LIMIT 5"
-                    interpretation = full_text
+                    if "---SPLIT---" in full_text:
+                        parts = full_text.split("---SPLIT---")
+                        sql_query = parts[0].replace("```sql", "").replace("```", "").strip()
+                        interpretation = parts[1].strip()
+                    else:
+                        sql_query = "SELECT country, total_revenue, total_orders FROM df_countries ORDER BY total_revenue DESC LIMIT 5"
+                        interpretation = full_text
 
-                result_df = duckdb.query(sql_query).df()
-                return sql_query, result_df, interpretation
+                    result_df = duckdb.query(sql_query).df()
+                    return sql_query, result_df, interpretation
 
-            except Exception as e:
-                err_str = str(e)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str) and attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                break  # Pasa al siguiente modelo si falla este
+                except Exception as e:
+                    err_str = str(e)
+                    if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str) and attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    break
 
     # =========================================================================
-    # FALLBACK AUTOMÁTICO EN CASO DE AGOTAR CUOTA DIARIA DE LA API
+    # FALLBACK LOCAL AUTOMÁTICO (OFFLINE / QUOTA LIMIT)
     # =========================================================================
-    query_lower = user_query.lower()
-    
-    if "producto" in query_lower or "articulo" in query_lower or "vendido" in query_lower:
+    if any(w in query_lower for w in ["producto", "articulo", "vendido", "item"]):
         fallback_sql = "SELECT product_name, units_sold, total_revenue FROM df_products ORDER BY total_revenue DESC LIMIT 5"
         res_df = duckdb.query(fallback_sql).df()
         top_item = res_df.iloc[0]['product_name']
         top_rev = res_df.iloc[0]['total_revenue']
-        fallback_interp = f"### Resumen Ejecutivo: Productos Principales\n\nEl producto con mayor recaudación es **{top_item}**, generando un total de **${top_rev:,.2f} USD**. A continuación se detallan los 5 artículos con mayor desempeño en ventas."
+        fallback_interp = f"### Resumen Ejecutivo: Productos Principales\n\nEl producto con mayor recaudación es **{top_item}**, generando un total de **${top_rev:,.2f} USD**."
     else:
         fallback_sql = "SELECT country, total_revenue, total_orders, avg_order_value FROM df_countries ORDER BY total_revenue DESC LIMIT 5"
         res_df = duckdb.query(fallback_sql).df()
         top_c = res_df.iloc[0]['country']
         top_rev = res_df.iloc[0]['total_revenue']
-        fallback_interp = f"### Resumen Ejecutivo: Análisis Geográfico\n\nEl mercado líder en volumen transaccional es **{top_c}**, con una facturación acumulada de **${top_rev:,.2f} USD**. Los datos reflejan una alta concentración de demanda en los mercados principales del Lakehouse."
+        fallback_interp = f"### Resumen Ejecutivo: Análisis Geográfico\n\nEl mercado líder en volumen transaccional es **{top_c}**, con una facturación acumulada de **${top_rev:,.2f} USD**."
 
     return fallback_sql, res_df, fallback_interp
 
@@ -166,7 +184,7 @@ st.markdown("---")
 
 if not df_products.empty and not df_countries.empty:
 
-    # ÚNICA barra de pestañas
+    # Pestañas de Navegación
     tab_dashboard, tab_streaming, tab_agent = st.tabs([
         "📊 Dashboard Ejecutivo", 
         "⚡ Pipeline Streaming en Vivo", 
