@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - '01_bronze_ingestion.py'
+      - 'databricks_notebooks/01_bronze_ingestion.py'
 
 jobs:
   run-pipeline:
@@ -22,5 +22,5 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Bronze Ingestion Script
-        run: python 01_bronze_ingestion.py
+      - name: Run script
+        run: python databricks_notebooks/01_bronze_ingestion.py
