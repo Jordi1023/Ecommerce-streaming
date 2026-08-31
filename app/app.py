@@ -29,6 +29,21 @@ if GEMINI_API_KEY:
 else:
     client_gemini = None
 
+# Función robusta con reintentos automáticos para evitar errores 503
+def call_gemini_with_retry(prompt, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            response = client_gemini.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise e
+
 # Función de carga de datos desde S3 (Capa Gold)
 @st.cache_data(ttl=15)
 def load_gold_data():
@@ -253,7 +268,7 @@ if not df_products.empty and not df_countries.empty:
                 st.markdown(prompt)
 
             if not client_gemini:
-                st.error("No se encontró `GEMINI_API_KEY` en el archivo `.env`. Configúrala para activar el asistente.")
+                st.error("No se encontró `GEMINI_API_KEY` en los Secrets/Entorno. Configúrala para activar el asistente.")
             else:
                 with st.chat_message("assistant"):
                     with st.spinner("Analizando esquemas y consultando Delta Lake con Gemini..."):
@@ -277,19 +292,15 @@ if not df_products.empty and not df_countries.empty:
                         """
 
                         try:
-                            # 1. Generar SQL con Gemini 3.6 Flash
+                            # 1. Generar SQL con reintentos
                             sql_prompt = f"{schema_context}\n\nPregunta del usuario: {prompt}"
-                            sql_response = client_gemini.models.generate_content(
-                                model='gemini-3.6-flash',
-                                contents=sql_prompt,
-                            )
-                            raw_sql = sql_response.text.strip()
+                            raw_sql = call_gemini_with_retry(sql_prompt)
                             clean_sql = raw_sql.replace("```sql", "").replace("```", "").strip()
 
                             # 2. Ejecutar SQL en memoria con DuckDB
                             query_result_df = duckdb.query(clean_sql).df()
 
-                            # 3. Interpretación ejecutiva con Gemini
+                            # 3. Interpretación ejecutiva con reintentos
                             interpretation_prompt = f"""
                             Eres un Lead Data Analyst experto en Lakehouses de E-Commerce.
                             El usuario preguntó: "{prompt}"
@@ -300,11 +311,7 @@ if not df_products.empty and not df_countries.empty:
                             Brinda una respuesta concisa, ejecutiva y con formato profesional (destaca montos en $, porcentajes y cantidades).
                             """
                             
-                            interp_response = client_gemini.models.generate_content(
-                                model='gemini-3.6-flash',
-                                contents=interpretation_prompt,
-                            )
-                            final_answer = interp_response.text
+                            final_answer = call_gemini_with_retry(interpretation_prompt)
 
                             # Desplegar respuesta + SQL auditable
                             st.markdown(final_answer)
