@@ -42,7 +42,7 @@ def stream_real_dataset(batch_size: int = 50, sleep_seconds: float = 1.0):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"No se encontró el dataset en {csv_path}. Ejecuta primero download_real_data.py")
         
-    print("📂 Leyendo dataset real...")
+    print(" Leyendo dataset real...")
     df = pd.read_csv(csv_path)
     
     # Limpieza inicial de nulos en identificadores clave
@@ -87,7 +87,7 @@ def stream_real_dataset(batch_size: int = 50, sleep_seconds: float = 1.0):
             s3_path = push_micro_batch_to_s3(events)
             total_sent += len(events)
             
-            print(f"⚡ [Lote #{batch_num:04d}] +{len(events)} eventos reales enviados | Total: {total_sent:,} / {total_rows:,}")
+            print(f" [Lote #{batch_num:04d}] +{len(events)} eventos reales enviados | Total: {total_sent:,} / {total_rows:,}")
             time.sleep(sleep_seconds)
             
     except KeyboardInterrupt:
