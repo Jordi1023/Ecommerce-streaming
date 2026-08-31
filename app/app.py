@@ -29,20 +29,73 @@ if GEMINI_API_KEY:
 else:
     client_gemini = None
 
-# Función robusta con reintentos automáticos para evitar errores 503
-def call_gemini_with_retry(prompt, max_retries=3):
-    for attempt in range(max_retries):
+# Función robusta para consultar Gemini en 1 sola llamada (optimiza cuotas y evita errores 429/503)
+def process_agent_query(user_query):
+    """
+    Agente de IA Resiliente:
+    - 1 sola llamada a la API (ahorra 50% de cuota)
+    - Cascada de Fallback multimodelo para evitar el error 429
+    """
+    schema_prompt = f"""
+Eres un Analista de Datos Senior especializado en SQL (DuckDB) y analítica de E-Commerce.
+
+Esquema de tablas en memoria (DuckDB):
+1. `df_products` (product_name VARCHAR, total_revenue DOUBLE, units_sold BIGINT, total_orders BIGINT)
+2. `df_countries` (country VARCHAR, total_revenue DOUBLE, unique_customers BIGINT, total_orders BIGINT, avg_order_value DOUBLE)
+
+Pregunta del usuario: "{user_query}"
+
+INSTRUCCIONES:
+1. Genera una consulta SQL ANSI válida para DuckDB.
+2. Escribe una respuesta ejecutiva en español estructurada con métricas clave, totales en USD y conclusiones comerciales.
+3. Responde EXACTAMENTE en este formato separado por '---SPLIT---':
+
+[SQL PLANO SIN BLOQUES MARKDOWN]
+---SPLIT---
+[ANÁLISIS EJECUTIVO EN FORMATO MARKDOWN]
+"""
+
+    # Modelos en orden de prioridad para fallback si se agota la cuota
+    MODELS_CASCADE = [
+        'gemini-2.5-flash',
+        'gemini-1.5-flash',
+        'gemini-2.0-flash',
+        'gemini-2.5-flash-lite'
+    ]
+
+    last_error = None
+
+    for model_name in MODELS_CASCADE:
         try:
             response = client_gemini.models.generate_content(
-                model='gemini-3.6-flash',
-                contents=prompt,
+                model=model_name,
+                contents=schema_prompt,
             )
-            return response.text
+            full_text = response.text.strip()
+
+            if "---SPLIT---" in full_text:
+                parts = full_text.split("---SPLIT---")
+                sql_query = parts[0].replace("```sql", "").replace("```", "").strip()
+                interpretation = parts[1].strip()
+            else:
+                sql_query = "SELECT country, total_revenue FROM df_countries ORDER BY total_revenue DESC LIMIT 5"
+                interpretation = full_text
+
+            # Ejecución en DuckDB
+            result_df = duckdb.query(sql_query).df()
+            return sql_query, result_df, interpretation
+
         except Exception as e:
-            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < max_retries - 1:
-                time.sleep(2 * (attempt + 1))
+            err_str = str(e)
+            last_error = e
+            # Si el modelo actual agotó cuota (429) o no está disponible, pasa al siguiente
+            if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                time.sleep(1)
                 continue
-            raise e
+            else:
+                raise e
+
+    raise Exception(f"Todos los modelos de respaldo agotaron su cuota temporal: {last_error}")
 
 # Función de carga de datos desde S3 (Capa Gold)
 @st.cache_data(ttl=15)
@@ -92,6 +145,7 @@ def load_gold_data():
     except Exception as e:
         st.error(f"Error al leer datos desde S3: {e}")
         return pd.DataFrame(), pd.DataFrame()
+
 # Cargar DataFrames
 df_products, df_countries = load_gold_data()
 
@@ -250,8 +304,16 @@ if not df_products.empty and not df_countries.empty:
     # PESTAÑA 3: AGENTE IA (TEXT-TO-SQL CON GEMINI)
     # ==========================================
     with tab_agent:
-        st.subheader("🤖 Asistente de Analítica del Lakehouse (Powered by Gemini)")
-        st.caption("Haz preguntas en lenguaje natural. Gemini interpretará tu consulta, generará SQL sobre DuckDB y te devolverá el análisis financiero.")
+        col_ag_title, col_ag_btn = st.columns([4, 1])
+        with col_ag_title:
+            st.subheader("🤖 Asistente de Analítica del Lakehouse (Powered by Gemini)")
+            st.caption("Haz preguntas en lenguaje natural. Gemini interpretará tu consulta, generará SQL sobre DuckDB y te devolverá el análisis financiero.")
+        with col_ag_btn:
+            if st.button("🗑️ Limpiar Chat", use_container_width=True):
+                st.session_state.messages = [
+                    {"role": "assistant", "content": "¡Hola! Soy tu asistente de analítica del Lakehouse. Puedes preguntarme sobre ventas, ticket promedio, países o productos más vendidos."}
+                ]
+                st.rerun()
 
         if "messages" not in st.session_state:
             st.session_state.messages = [
@@ -272,46 +334,8 @@ if not df_products.empty and not df_countries.empty:
             else:
                 with st.chat_message("assistant"):
                     with st.spinner("Analizando esquemas y consultando Delta Lake con Gemini..."):
-                        schema_context = """
-                        Tienes a tu disposición 2 tablas en DuckDB / SQL estándar:
-                        
-                        1. Tabla `df_products`:
-                           - product_name (VARCHAR): Nombre del producto
-                           - total_revenue (DOUBLE): Ingresos generados en USD
-                           - units_sold (BIGINT): Cantidad total de unidades vendidas
-                           - total_orders (BIGINT): Cantidad de órdenes donde se vendió el producto
-
-                        2. Tabla `df_countries`:
-                           - country (VARCHAR): Nombre del país
-                           - total_revenue (DOUBLE): Ingresos generados en USD
-                           - unique_customers (BIGINT): Total de clientes únicos
-                           - total_orders (BIGINT): Total de órdenes realizadas
-                           - avg_order_value (DOUBLE): Ticket promedio por orden en USD
-
-                        Genera ÚNICAMENTE una consulta SQL válida (sin explicaciones adicionales, sin markdown ```sql, solo el texto SQL plano) para responder la pregunta del usuario.
-                        """
-
                         try:
-                            # 1. Generar SQL con reintentos
-                            sql_prompt = f"{schema_context}\n\nPregunta del usuario: {prompt}"
-                            raw_sql = call_gemini_with_retry(sql_prompt)
-                            clean_sql = raw_sql.replace("```sql", "").replace("```", "").strip()
-
-                            # 2. Ejecutar SQL en memoria con DuckDB
-                            query_result_df = duckdb.query(clean_sql).df()
-
-                            # 3. Interpretación ejecutiva con reintentos
-                            interpretation_prompt = f"""
-                            Eres un Lead Data Analyst experto en Lakehouses de E-Commerce.
-                            El usuario preguntó: "{prompt}"
-                            Se ejecutó la consulta SQL: `{clean_sql}`
-                            El resultado obtenido fue:
-                            {query_result_df.to_string(index=False)}
-
-                            Brinda una respuesta concisa, ejecutiva y con formato profesional (destaca montos en $, porcentajes y cantidades).
-                            """
-                            
-                            final_answer = call_gemini_with_retry(interpretation_prompt)
+                            clean_sql, query_result_df, final_answer = process_agent_query(prompt)
 
                             # Desplegar respuesta + SQL auditable
                             st.markdown(final_answer)
