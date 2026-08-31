@@ -1,0 +1,26 @@
+name: Run Bronze Ingestion
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '01_bronze_ingestion.py'
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Bronze Ingestion Script
+        run: python 01_bronze_ingestion.py
