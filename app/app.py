@@ -14,67 +14,98 @@ st.set_page_config(
     layout="wide"
 )
 
-# Cargar variables de entorno (.env)
+# Cargar variables locales si existen
 load_dotenv()
 
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
-S3_BUCKET = "ecommerce-streaming-jordi-2026"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Función para obtener credenciales (compatible con local .env y Streamlit Cloud Secrets)
+def get_secret(key, default=None):
+    if key in st.secrets:
+        return st.secrets[key]
+    return os.getenv(key, default)
+
+AWS_ACCESS_KEY = get_secret("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = get_secret("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = get_secret("AWS_DEFAULT_REGION", "us-east-2")
+S3_BUCKET = get_secret("S3_BUCKET", "ecommerce-streaming-jordi-2026")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 
 # Inicializar cliente oficial de Gemini
-if GEMINI_API_KEY:
-    client_gemini = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client_gemini = None
+client_gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Función para procesar consultas en 1 sola llamada con manejo conversacional y fallback
+# Función de consulta y análisis con IA + Fallback local
 def process_agent_query(user_query, max_retries=2):
     """
     Agente Text-to-SQL de alta resiliencia:
-    - Maneja preguntas conversacionales y de capacidades.
-    - Genera SQL ANSI y diagnóstico para preguntas analíticas.
-    - Fallback local estructurado e inteligente.
+    - Filtra intenciones generales (saludos, hora, preguntas fuera de contexto).
+    - Ejecuta Text-to-SQL en 1 llamada con Gemini.
+    - Conmuta a motor heurístico local sobre DuckDB si la cuota de la API se agota.
     """
-    query_lower = user_query.lower()
+    query_lower = user_query.lower().strip()
 
-    # Detección de preguntas sobre capacidades o saludos
-    greeting_keywords = ["que haces", "que eres capaz", "quien eres", "capacidades", "ayuda", "hola"]
-    if any(k in query_lower for k in greeting_keywords) and not any(k in query_lower for k in ["venta", "producto", "pais", "top", "ingreso"]):
-        desc_text = """
+    # 1. Manejo de consultas fuera de dominio / conversacionales
+    general_topics = [
+        "hola", "buenos dias", "buenas tardes", "buenas noches", "quien eres",
+        "que haces", "que eres capaz", "capacidades", "ayuda", "hora",
+        "clima", "chiste", "quien te creo", "futbol", "precio del dolar"
+    ]
+    is_general = any(t in query_lower for t in general_topics)
+    has_business_terms = any(b in query_lower for b in [
+        "venta", "producto", "pais", "paises", "top", "ingreso", "orden", 
+        "ticket", "gmv", "facturacion", "comprador", "cliente", "articulos"
+    ])
+
+    if is_general and not has_business_terms:
+        if "hora" in query_lower:
+            server_time = pd.Timestamp.now().strftime("%H:%M:%S")
+            desc_text = f"🕒 La hora del servidor analítico es **{server_time}**. ¡Estoy listo para consultar transacciones de e-commerce cuando lo necesites!"
+        elif any(g in query_lower for g in ["hola", "buenos dias", "buenas tardes", "buenas noches"]):
+            desc_text = "👋 ¡Hola! Soy tu **Asistente de Analítica del Lakehouse**. Pregúntame sobre ingresos totales, ranking de productos, comportamiento de países o ticket promedio."
+        else:
+            desc_text = """
 ### 🤖 Capacidades del Asistente Analítico del Lakehouse
 
 Estoy conectado directamente a los datos consolidados en **AWS S3 / DuckDB** y puedo ayudarte con:
 
-* **📊 Análisis de Ventas Globales:** Consultar GMV acumulado, ticket promedio y cantidad de órdenes.
-* **🌍 Desempeño Geográfico:** Identificar los países con mayor y menor volumen transaccional.
-* **🏆 Rendimiento de Catálogo:** Ranking de productos más vendidos por unidades e ingresos generados.
-* **🔍 Generación SQL Auditable:** Traduzco tus consultas de negocio a queries SQL ANSI ejecutadas al instante en DuckDB.
+* **📊 Desempeño Financiero:** GMV consolidado, órdenes totales y ticket promedio ($).
+* **🌍 Análisis Geográfico:** Países con mayor y menor volumen de compras.
+* **🏆 Desempeño de Productos:** Artículos líderes en facturación y unidades despachadas.
+* **🔍 Auditoría SQL:** Visualización transparente de cada consulta generada y ejecutada en DuckDB.
 
-*Ejemplo de preguntas:*
-1. *"¿Cuáles son los 5 países con mayor facturación?"*
-2. *"¿Cuál es el producto líder en unidades vendidas?"*
+*Prueba preguntando:*
+* *"¿Cuáles son los 5 países con más ventas?"*
+* *"¿Qué producto generó mayor facturación?"*
+* *"¿Cuál es el ticket promedio por país?"*
 """
         return "-- Consulta conversacional / Presentación de capacidades", pd.DataFrame(), desc_text
 
+    # 2. Prompt Text-to-SQL optimizado para 1 sola llamada (1-shot)
     schema_prompt = f"""
-Eres un Analista de Datos Senior especializado en SQL (DuckDB) y analítica de E-Commerce.
+Eres un Analista de Datos Senior especializado en SQL ANSI (DuckDB) y finanzas para E-Commerce.
 
-Esquema de tablas en DuckDB:
-1. `df_products` (product_name VARCHAR, total_revenue DOUBLE, units_sold BIGINT, total_orders BIGINT)
-2. `df_countries` (country VARCHAR, total_revenue DOUBLE, unique_customers BIGINT, total_orders BIGINT, avg_order_value DOUBLE)
+Esquema de tablas disponibles en DuckDB:
+1. `df_products`:
+   - product_name (VARCHAR): Nombre del producto
+   - total_revenue (DOUBLE): Facturación en USD
+   - units_sold (BIGINT): Cantidad de unidades vendidas
+   - total_orders (BIGINT): Órdenes donde se incluyó el producto
+
+2. `df_countries`:
+   - country (VARCHAR): País
+   - total_revenue (DOUBLE): Facturación en USD
+   - unique_customers (BIGINT): Clientes únicos
+   - total_orders (BIGINT): Total de órdenes
+   - avg_order_value (DOUBLE): Ticket promedio por orden en USD
 
 Pregunta del usuario: "{user_query}"
 
-INSTRUCCIONES:
+INSTRUCCIONES DE RESPUESTA:
 1. Genera una consulta SQL ANSI válida para DuckDB.
-2. Escribe una respuesta ejecutiva estructurada con métricas clave, totales en USD y conclusiones comerciales.
-3. Responde EXACTAMENTE en este formato separado por '---SPLIT---':
+2. Redacta un análisis ejecutivo en español con formato Markdown profesional (destaca montos en $, cantidades y conclusiones de negocio).
+3. Responde EXACTAMENTE con este formato separado por la etiqueta '---SPLIT---':
 
-[SQL PLANO SIN BLOQUES MARKDOWN]
+[SQL PLANO SIN BLOQUES DE CÓDIGO NI MARKDOWN]
 ---SPLIT---
-[ANÁLISIS EJECUTIVO EN FORMATO MARKDOWN]
+[ANÁLISIS EJECUTIVO EN ESPAÑOL]
 """
 
     VALID_MODELS = ['gemini-3.6-flash', 'gemini-3.6-flash-lite']
@@ -107,26 +138,24 @@ INSTRUCCIONES:
                         continue
                     break
 
-    # =========================================================================
-    # FALLBACK LOCAL AUTOMÁTICO (OFFLINE / QUOTA LIMIT)
-    # =========================================================================
-    if any(w in query_lower for w in ["producto", "articulo", "vendido", "item"]):
+    # 3. Fallback Local Automático si la API agota su cuota
+    if any(w in query_lower for w in ["producto", "articulo", "item", "stock"]):
         fallback_sql = "SELECT product_name, units_sold, total_revenue FROM df_products ORDER BY total_revenue DESC LIMIT 5"
         res_df = duckdb.query(fallback_sql).df()
-        top_item = res_df.iloc[0]['product_name']
+        top_name = res_df.iloc[0]['product_name']
         top_rev = res_df.iloc[0]['total_revenue']
-        fallback_interp = f"### Resumen Ejecutivo: Productos Principales\n\nEl producto con mayor recaudación es **{top_item}**, generando un total de **${top_rev:,.2f} USD**."
+        fallback_interp = f"### Resumen Ejecutivo: Productos Destacados\n\nEl producto con mayor recaudación histórica es **{top_name}**, acumulando **${top_rev:,.2f} USD** en facturación."
     else:
         fallback_sql = "SELECT country, total_revenue, total_orders, avg_order_value FROM df_countries ORDER BY total_revenue DESC LIMIT 5"
         res_df = duckdb.query(fallback_sql).df()
         top_c = res_df.iloc[0]['country']
         top_rev = res_df.iloc[0]['total_revenue']
-        fallback_interp = f"### Resumen Ejecutivo: Análisis Geográfico\n\nEl mercado líder en volumen transaccional es **{top_c}**, con una facturación acumulada de **${top_rev:,.2f} USD**."
+        fallback_interp = f"### Resumen Ejecutivo: Desempeño Geográfico\n\nEl mercado principal en volumen de ventas es **{top_c}**, con una facturación consolidada de **${top_rev:,.2f} USD**."
 
     return fallback_sql, res_df, fallback_interp
 
-# Función de carga de datos desde S3 (Capa Gold)
-@st.cache_data(ttl=15)
+# Carga de datos desde S3 (Capa Gold)
+@st.cache_data(ttl=60)
 def load_gold_data():
     try:
         con = duckdb.connect()
@@ -177,14 +206,13 @@ def load_gold_data():
 # Cargar DataFrames
 df_products, df_countries = load_gold_data()
 
-# Header Principal
+# Encabezado Principal
 st.title("⚡ E-Commerce Streaming Lakehouse & AI Agent")
 st.markdown("Plataforma analítica con **Databricks Medallion Architecture** y **Agente Conversacional Text-to-SQL (Gemini)**.")
 st.markdown("---")
 
 if not df_products.empty and not df_countries.empty:
 
-    # Pestañas de Navegación
     tab_dashboard, tab_streaming, tab_agent = st.tabs([
         "📊 Dashboard Ejecutivo", 
         "⚡ Pipeline Streaming en Vivo", 
@@ -367,9 +395,10 @@ if not df_products.empty and not df_countries.empty:
 
                             # Desplegar respuesta + SQL auditable
                             st.markdown(final_answer)
-                            with st.expander("🔍 Ver consulta SQL generada y resultado"):
-                                st.code(clean_sql, language="sql")
-                                st.dataframe(query_result_df, use_container_width=True)
+                            if not query_result_df.empty:
+                                with st.expander("🔍 Ver consulta SQL generada y resultado"):
+                                    st.code(clean_sql, language="sql")
+                                    st.dataframe(query_result_df, use_container_width=True)
 
                             st.session_state.messages.append({"role": "assistant", "content": final_answer})
 
