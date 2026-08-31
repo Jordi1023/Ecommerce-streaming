@@ -1,4 +1,4 @@
--- Consulta analítica: Top 10 productos con mayor recaudación
+-- Top 10 productos con mayor recaudación
 SELECT 
     product_name AS Producto,
     total_revenue AS Ingresos_Totales_USD,
