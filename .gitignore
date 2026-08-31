@@ -1,0 +1,13 @@
+# Entorno virtual y Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Variables de entorno y credenciales (NUNCA SUBIR)
+.env
+
+# Archivos de sistema y logs
+*.log
+.DS_Store
+.vscode/

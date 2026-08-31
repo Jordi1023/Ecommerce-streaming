@@ -1,0 +1,9 @@
+streamlit
+pandas
+plotly
+duckdb
+google-genai
+python-dotenv
+pyarrow
+s3fs
+boto3

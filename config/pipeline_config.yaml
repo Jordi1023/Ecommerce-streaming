@@ -1,0 +1,19 @@
+aws:
+  s3_bucket: "ecommerce-streaming-jordi-2026"
+  region: "us-east-2"
+
+paths:
+  landing_raw: "raw_landing/ecommerce_stream"
+  checkpoints:
+    bronze: "checkpoints/bronze_ecommerce"
+    silver: "checkpoints/silver_ecommerce"
+  delta_tables:
+    bronze: "delta/bronze_ecommerce_events"
+    silver: "delta/silver_ecommerce_orders"
+    gold_top_products: "delta/gold_top_products"
+    gold_sales_country: "delta/gold_sales_by_country"
+
+streaming:
+  batch_size: 50
+  emission_interval_seconds: 1.0
+  trigger_mode: "availableNow"
