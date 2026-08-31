@@ -47,18 +47,19 @@ def call_gemini_with_retry(prompt, max_retries=3):
 # Función de carga de datos desde S3 (Capa Gold)
 @st.cache_data(ttl=15)
 def load_gold_data():
-    storage_options = {
-        "key": AWS_ACCESS_KEY,
-        "secret": AWS_SECRET_KEY
-    }
-    
-    top_products_path = f"s3://{S3_BUCKET}/delta/gold_top_products/"
-    country_sales_path = f"s3://{S3_BUCKET}/delta/gold_sales_by_country/"
-    
     try:
-        raw_products = pd.read_parquet(top_products_path, storage_options=storage_options)
-        raw_countries = pd.read_parquet(country_sales_path, storage_options=storage_options)
-        
+        con = duckdb.connect()
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute(f"SET s3_access_key_id='{AWS_ACCESS_KEY}';")
+        con.execute(f"SET s3_secret_access_key='{AWS_SECRET_KEY}';")
+        con.execute(f"SET s3_region='{AWS_REGION}';")
+
+        top_products_path = f"s3://{S3_BUCKET}/delta/gold_top_products/*.parquet"
+        country_sales_path = f"s3://{S3_BUCKET}/delta/gold_sales_by_country/*.parquet"
+
+        raw_products = con.execute(f"SELECT * FROM read_parquet('{top_products_path}')").df()
+        raw_countries = con.execute(f"SELECT * FROM read_parquet('{country_sales_path}')").df()
+
         # 1. Consolidar productos
         df_products = (
             raw_products.groupby("product_name", as_index=False)
@@ -68,7 +69,7 @@ def load_gold_data():
                 "total_orders": "sum"
             })
         )
-        
+
         # 2. Consolidar países y calcular ticket promedio
         df_countries = (
             raw_countries[
@@ -86,12 +87,11 @@ def load_gold_data():
             lambda row: row["total_revenue"] / row["total_orders"] if row["total_orders"] > 0 else 0,
             axis=1
         )
-        
+
         return df_products, df_countries
     except Exception as e:
         st.error(f"Error al leer datos desde S3: {e}")
         return pd.DataFrame(), pd.DataFrame()
-
 # Cargar DataFrames
 df_products, df_countries = load_gold_data()
 
