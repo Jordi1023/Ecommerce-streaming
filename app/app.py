@@ -34,7 +34,7 @@ def call_gemini_with_retry(prompt, max_retries=3):
     for attempt in range(max_retries):
         try:
             response = client_gemini.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-3.6-flash',
                 contents=prompt,
             )
             return response.text
