@@ -1,5 +1,3 @@
--- Auditoría de volumen e integridad de la arquitectura Medallion
-
 -- 1. Total de eventos crudos en Bronze
 SELECT count(*) AS total_bronze 
 FROM delta.`s3a://AKIAWTL3NUA52H2ZXUPY:omRKcv0gtMSaS2H5Hf5cfloHOg6%2FgHTOEU47MbyR@ecommerce-streaming-jordi-2026/delta/bronze_ecommerce_events`;
